@@ -1,3 +1,6 @@
 go 1.19
 
-use ./maelstrom-echo
+use (
+	./maelstrom-echo
+	./maelstrom-unique-ids
+)
