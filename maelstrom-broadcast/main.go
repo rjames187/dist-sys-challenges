@@ -16,7 +16,10 @@ func broadcastHandler(msg maelstrom.Message) error {
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 	}
-
+	
+	if body["type"] == "broadcast_ok" {
+		return nil
+	}
 	value := body["message"].(float64)
 
 	// check if this node already received the broadcast
@@ -28,13 +31,27 @@ func broadcastHandler(msg maelstrom.Message) error {
 
 	seen = append(seen, value)
 
+	// initalize queue of neighnor nodes to call
+	queue := []string{}
 	for node, neighbors := range topology {
 		if node == msg.Dest {
 			for _, neighbor := range neighbors.([]any) {
-				n.RPC(neighbor.(string), body, broadcastHandler)
+				queue = append(queue, neighbor.(string))
 			}
 			break
 		}
+	}
+
+	// try to broadcast to neighbors and retry if necessary
+	for len(queue) > 0 {
+		newQueue := []string{}
+		for _, node := range queue {
+			err := n.RPC(node, map[string]any{"type": "broadcast", "message": value}, broadcastHandler)
+			if err != nil {
+				newQueue = append(newQueue, node)
+			}
+		}
+		queue = newQueue
 	}
 
 	return n.Reply(msg, map[string]any{"type": "broadcast_ok"})
