@@ -3,62 +3,73 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-var seen = []float64{}
-var topology = map[string]any{}
-var n = maelstrom.NewNode()
-
-func broadcastHandler(msg maelstrom.Message) error {
-	var body map[string]any
-	if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-	}
-	
-	if body["type"] == "broadcast_ok" {
-		return nil
-	}
-	value := body["message"].(float64)
-
-	// check if this node already received the broadcast
-	for _, v := range seen {
-		if value == v {
-			return n.Reply(msg, map[string]any{"type": "broadcast_ok"})
-		}
-	}
-
-	seen = append(seen, value)
-
-	// initalize queue of neighnor nodes to call
-	queue := []string{}
-	for node, neighbors := range topology {
-		if node == msg.Dest {
-			for _, neighbor := range neighbors.([]any) {
-				queue = append(queue, neighbor.(string))
-			}
-			break
-		}
-	}
-
-	// try to broadcast to neighbors and retry if necessary
-	for len(queue) > 0 {
-		newQueue := []string{}
-		for _, node := range queue {
-			err := n.RPC(node, map[string]any{"type": "broadcast", "message": value}, broadcastHandler)
-			if err != nil {
-				newQueue = append(newQueue, node)
-			}
-		}
-		queue = newQueue
-	}
-
-	return n.Reply(msg, map[string]any{"type": "broadcast_ok"})
-}
 
 func main() {
-	n.Handle("broadcast", broadcastHandler)
+	n := maelstrom.NewNode()
+
+	state := map[float64]bool{}
+	mu := &sync.Mutex{}
+	heartbeatInterval := 400 * time.Millisecond
+	done := false
+	defer func() { done = true }()
+
+	// background goroutine periodically sends a heartbeat with state info attached
+	go func() {
+		for {
+			if done {
+				break
+			}
+			time.Sleep(heartbeatInterval)
+
+			stateToSend := []float64{}
+			mu.Lock()
+			for val := range state {
+				stateToSend = append(stateToSend, val)
+			}
+			mu.Unlock()
+
+			for _, node := range n.NodeIDs() {
+				err := n.Send(node, map[string]any{"type": "heartbeat", "state": stateToSend})
+				if err != nil {
+					panic(err)
+				}
+			}
+		}
+	}()
+	
+	n.Handle("heartbeat", func(msg maelstrom.Message) error {
+		var body map[string]any
+    if err := json.Unmarshal(msg.Body, &body); err != nil {
+        return err
+    }
+
+		mu.Lock()
+		for _, val := range body["state"].([]any) {
+			state[val.(float64)] = true
+		}
+		mu.Unlock()
+
+		return nil
+	})
+
+	n.Handle("broadcast", func(msg maelstrom.Message) error {
+		var body map[string]any
+    if err := json.Unmarshal(msg.Body, &body); err != nil {
+        return err
+    }
+		val := body["message"].(float64)
+		mu.Lock()
+		state[val] = true
+		mu.Unlock()
+
+		return n.Reply(msg, map[string]any{"type": "broadcast_ok"})
+	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
     var body map[string]any
@@ -66,10 +77,14 @@ func main() {
         return err
     }
 
-    body["type"] = "read_ok"
-		body["messages"] = seen
+		read := []float64{}
+		mu.Lock()
+		for val := range state {
+			read = append(read, val)
+		}
+		mu.Unlock()
 
-    return n.Reply(msg, body)
+    return n.Reply(msg, map[string]any{"type": "read_ok", "messages": read})
 	})
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
@@ -77,8 +92,6 @@ func main() {
     if err := json.Unmarshal(msg.Body, &body); err != nil {
         return err
     }
-
-		topology = body["topology"].(map[string]any)
 
     body["type"] = "topology_ok"
 		delete(body, "topology")
