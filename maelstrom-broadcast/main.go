@@ -15,7 +15,7 @@ func main() {
 
 	state := map[float64]bool{}
 	mu := &sync.Mutex{}
-	heartbeatInterval := 400 * time.Millisecond
+	heartbeatInterval := 700 * time.Millisecond
 	done := false
 	defer func() { done = true }()
 
