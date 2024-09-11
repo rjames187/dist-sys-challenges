@@ -42,8 +42,8 @@ func (l *Log) replaceLog(data []any) error {
 }
 
 func (l *Log) append(val float64) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	requestLock(l.key, l.kv)
+	defer releaseLock(l.key, l.kv)
 
 	data, err := l.retrieveLog()
 	if err != nil {
@@ -58,8 +58,8 @@ func (l *Log) append(val float64) (int, error) {
 }
 
 func (l *Log) commit(offset int) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	requestLock(l.key, l.kv)
+	defer releaseLock(l.key, l.kv)
 	ctx := context.TODO()
 
 	err := l.kv.Write(ctx, commitKey(l.key), offset)
@@ -67,6 +67,8 @@ func (l *Log) commit(offset int) error {
 }
 
 func (l *Log) getCommit() (int, error) {
+	requestLock(l.key, l.kv)
+	defer releaseLock(l.key, l.kv)
 	ctx := context.TODO()
 
 	offset, err := l.kv.ReadInt(ctx, commitKey(l.key))
@@ -75,6 +77,23 @@ func (l *Log) getCommit() (int, error) {
 		return -1, nil
 	}
 	return offset, err
+}
+
+func requestLock(key string, kv *maelstrom.KV) {
+	ctx := context.TODO()
+	
+	err := kv.CompareAndSwap(ctx, lockKey(key), 0, 1, true)
+	rpcErr := &maelstrom.RPCError{}
+	for errors.As(err, &rpcErr) && rpcErr.Code == maelstrom.PreconditionFailed {
+		err = kv.CompareAndSwap(ctx, "lock", 0, 1, true)
+	}
+}
+
+func releaseLock(key string, kv *maelstrom.KV) error {
+	ctx := context.TODO()
+
+	err := kv.Write(ctx, lockKey(key), 0)
+	return err
 }
 
 type Broker struct {
@@ -92,8 +111,8 @@ func NewBroker(kv *maelstrom.KV) *Broker {
 }
 
 func (b *Broker) getLog(key string) *Log {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	requestLock("broker", b.kv)
+	defer releaseLock("broker", b.kv)
 
 	aLog, ok := b.logs[key]
 	if !ok {
@@ -207,4 +226,8 @@ func logKey(key string) string {
 
 func commitKey(key string) string {
 	return fmt.Sprintf("cmt.%s", key)
+}
+
+func lockKey(key string) string {
+	return fmt.Sprintf("lock.%s", key)
 }
