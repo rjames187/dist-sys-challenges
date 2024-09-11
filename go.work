@@ -2,7 +2,8 @@ go 1.19
 
 use (
 	./maelstrom-broadcast
-	./maelstrom-echo
-	./maelstrom-unique-ids
 	./maelstrom-counter
+	./maelstrom-echo
+	./maelstrom-kafka
+	./maelstrom-unique-ids
 )
