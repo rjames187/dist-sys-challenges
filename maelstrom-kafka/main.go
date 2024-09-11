@@ -12,18 +12,14 @@ import (
 )
 
 type Log struct {
-	data []float64
 	mu *sync.Mutex
-	cmtOffset int
 	kv *maelstrom.KV
 	key string
 }
 
 func NewLog(kv *maelstrom.KV, key string) *Log {
 	return &Log{
-		[]float64{},
 		&sync.Mutex{},
-		-1,
 		kv,
 		logKey(key),
 	}
@@ -59,6 +55,26 @@ func (l *Log) append(val float64) (int, error) {
 		return 0, err
 	}
 	return len(data) - 1, nil
+}
+
+func (l *Log) commit(offset int) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	ctx := context.TODO()
+
+	err := l.kv.Write(ctx, commitKey(l.key), offset)
+	return err
+}
+
+func (l *Log) getCommit() (int, error) {
+	ctx := context.TODO()
+
+	offset, err := l.kv.ReadInt(ctx, commitKey(l.key))
+	rpcErr := &maelstrom.RPCError{}
+	if errors.As(err, &rpcErr) && rpcErr.Code == maelstrom.KeyDoesNotExist {
+		return -1, nil
+	}
+	return offset, err
 }
 
 type Broker struct {
@@ -151,7 +167,10 @@ func main() {
 		offsets := body["offsets"].(map[string]any)
 		for key, offset := range offsets {
 			aLog := broker.getLog(key)
-			aLog.cmtOffset = int(offset.(float64))
+			err := aLog.commit(int(offset.(float64)))
+			if err != nil {
+				return err
+			}
 		}
 
 		return n.Reply(msg, map[string]any{"type": "commit_offsets_ok"})
@@ -167,7 +186,11 @@ func main() {
 		keys := body["keys"].([]any)
 		for _, key := range keys {
 			aLog := broker.getLog(key.(string))
-			offsets[key.(string)] = aLog.cmtOffset
+			offset, err := aLog.getCommit()
+			if err != nil {
+				return err
+			}
+			offsets[key.(string)] = offset
 		}
 
 		return n.Reply(msg, map[string]any{"type": "list_committed_offsets_ok", "offsets": offsets})
@@ -180,4 +203,8 @@ func main() {
 
 func logKey(key string) string {
 	return fmt.Sprintf("log.%s", key)
+}
+
+func commitKey(key string) string {
+	return fmt.Sprintf("cmt.%s", key)
 }
