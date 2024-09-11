@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -10,47 +11,83 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+var kvMu = &sync.Mutex{}
+
+func read(nodeID string, kv *maelstrom.KV) (int, error) {
+	ctx := context.TODO()
+
+	count, err := kv.ReadInt(ctx, nodeID)
+	rpcErr := &maelstrom.RPCError{}
+	if errors.As(err, &rpcErr) && rpcErr.Code == maelstrom.KeyDoesNotExist {
+		return 0, nil
+	}
+	return count, err
+}
+
+func writeDelta(delta int, nodeID string, kv *maelstrom.KV) error {
+	ctx := context.TODO()
+
+	kvMu.Lock()
+	defer kvMu.Unlock()
+
+	count, err := read(nodeID, kv)
+	if err != nil {
+		return err
+	}
+
+	err = kv.Write(ctx, nodeID, count + delta)
+
+	return err
+}
+
 func main() {
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewSeqKV(n)
-	ctx := context.Background()
-
-	q := []int{}
-	mu := &sync.Mutex{}
-
-	startedCount := false
 
 	go func() {
 		for {
-			time.Sleep(time.Millisecond * 300)
+			time.Sleep(600 * time.Millisecond)
 
-			mu.Lock()
-			delta := 0
-			for _, num := range q {
-				delta += num
-			}
-			count, err := kv.ReadInt(ctx, "count")
+			count, err := read(n.ID(), kv)
 			if err != nil {
-				continue
+				panic(err)
 			}
-			err = kv.CompareAndSwap(ctx, "count", count, count + delta, true)
-			if err != nil {
-				continue
+			for _, node := range n.NodeIDs() {
+				if node != n.ID() {
+					err = n.Send(node, map[string]any{"type": "heartbeat", "value": count})
+					if err != nil {
+						panic(err)
+					}
+				}
 			}
-			q = []int{}
-			mu.Unlock()
 		}
 	}()
+	
+	n.Handle("heartbeat", func(msg maelstrom.Message) error {
+		var body map[string]any
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+
+		value := int(body["value"].(float64))
+
+		kvMu.Lock()
+		defer kvMu.Unlock()
+		count, err := read(msg.Src, kv)
+		if err != nil {
+			return err
+		}
+		ctx := context.TODO()
+		if value > count {
+			err = kv.Write(ctx, msg.Src, value)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 
 	n.Handle("add", func(msg maelstrom.Message) error {
-		mu.Lock()
-		if !startedCount {
-			kv.CompareAndSwap(ctx, "count", 0, 0, true)
-			startedCount = true
-		}
-		mu.Unlock()
-
-
 		var body map[string]any
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
@@ -58,9 +95,10 @@ func main() {
 
 		delta := int(body["delta"].(float64))
 		
-		mu.Lock()
-		q = append(q, delta)
-		mu.Unlock()
+		err := writeDelta(delta, n.ID(), kv)
+		if err != nil {
+			return err
+		}
 
 		return n.Reply(msg, map[string]any{"type": "add_ok"})
 	})
@@ -71,14 +109,16 @@ func main() {
         return err
     }
 
-    body["type"] = "read_ok"
-		count, err := kv.ReadInt(ctx, "count")
-		if err != nil {
-			return err
+		total := 0
+		for _, node := range n.NodeIDs() {
+			count, err := read(node, kv)
+			if err != nil {
+				return err
+			}
+			total += count
 		}
-		body["value"] = count
     
-    return n.Reply(msg, body)
+    return n.Reply(msg, map[string]any{"type": "read_ok", "value": total})
 	})
 
 	if err := n.Run(); err != nil {
